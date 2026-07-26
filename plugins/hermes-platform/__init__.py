@@ -1,4 +1,8 @@
+from __future__ import annotations
+
 import logging
+
+from .doctor import doctor_command
 
 logger = logging.getLogger(__name__)
 
@@ -16,3 +20,9 @@ def register(ctx):
 
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
+
+    ctx.register_command(
+        name="doctor",
+        handler=doctor_command,
+        description="Hermes Platform diagnostics",
+    )

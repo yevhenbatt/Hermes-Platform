@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from .docker import docker_running, hermes_containers
+from .gitinfo import repo_status
+from .services import service_checks
+from .system import (
+    check_docker_compose,
+    check_ffmpeg,
+    check_git,
+    check_hermes_home,
+    check_node,
+    check_npm,
+    check_platform,
+    check_python,
+    check_ripgrep,
+    check_uv,
+)
+
+
+def doctor_command(args: str = "", **kwargs):
+    checks = [
+        check_python(),
+        check_platform(),
+        check_hermes_home(),
+        check_git(),
+        check_docker_compose(),
+        check_uv(),
+        check_node(),
+        check_npm(),
+        check_ffmpeg(),
+        check_ripgrep(),
+    ]
+
+    ok = 0
+    fail = 0
+
+    lines = []
+    lines.append("Hermes Platform Doctor")
+    lines.append("=" * 60)
+
+    width = max(len(c[0]) for c in checks)
+
+    for name, passed, value in checks:
+        icon = "✓" if passed else "✗"
+
+        if passed:
+            ok += 1
+        else:
+            fail += 1
+
+        lines.append(f"{icon} {name:<{width}} : {value}")
+
+    lines.append("")
+    lines.append("Docker")
+    lines.append("-" * 60)
+
+    if docker_running():
+        ok += 1
+        lines.append("✓ Docker Engine : Running")
+
+        containers = hermes_containers()
+
+        if containers:
+            lines.append("")
+            lines.append("Hermes Containers")
+
+            for name, image, status in containers:
+                lines.append(f"  ✓ {name}")
+                lines.append(f"      {image}")
+                lines.append(f"      {status}")
+        else:
+            lines.append("No Hermes containers found.")
+    else:
+        fail += 1
+        lines.append("✗ Docker Engine : Not available")
+
+    lines.append("")
+    lines.append("Repositories")
+    lines.append("-" * 60)
+
+    for name, exists, status in repo_status():
+        if exists:
+            lines.append(f"✓ {name:<18} {status}")
+        else:
+            lines.append(f"✗ {name:<18} {status}")
+
+    lines.append("")
+    lines.append("Services")
+    lines.append("-" * 60)
+
+    for name, running, status in service_checks():
+        if running:
+            ok += 1
+            lines.append(f"✓ {name:<14} {status}")
+        else:
+            fail += 1
+            lines.append(f"✗ {name:<14} {status}")
+
+    lines.append("")
+    lines.append(f"Summary: {ok} passed, {fail} failed")
+
+    return "\n".join(lines)
