@@ -11,6 +11,9 @@ CONTAINERS = {
     "Ollama": "hermes-ollama",
     "n8n": "hermes-n8n",
     "Portainer": "hermes-portainer",
+    "Graphify": "hermes-graphify",
+    "Paperclip": "hermes-paperclip",
+    "SwarmClaw": "hermes-swarmclaw",
 }
 
 

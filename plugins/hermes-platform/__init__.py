@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 
-from .doctor import doctor_command
+from .swarmclaw import register_middleware
+from .cli import register_cli
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,25 @@ def _on_session_end(**kwargs):
 def register(ctx):
     logger.info("[Hermes Platform] Plugin loaded")
 
+    #
+    # Hooks
+    #
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_end", _on_session_end)
 
-    ctx.register_command(
-        name="doctor",
-        handler=doctor_command,
-        description="Hermes Platform diagnostics",
+    #
+    # Commands
+    #
+    ctx.register_cli_command(
+        name="platform",
+        help="Hermes Platform management",
+        setup_fn=register_cli,
+        description="Manage Hermes Platform infrastructure",
     )
+
+    #
+    # Middleware
+    #
+    register_middleware(ctx)
+
+    logger.info("[Hermes Platform] SwarmClaw middleware registered")
