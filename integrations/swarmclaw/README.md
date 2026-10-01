@@ -41,3 +41,7 @@ Patch-set добавляет:
 `0002-hermes-private-adapter-tests-and-stop-route.patch` добавляет unit-тесты
 для проверки key и профиля, а также сохраняет совместимость с существующим
 маршрутом отмены `/executions/:id/stop`.
+
+`0003-install-codex-cli.patch` закрепляет CLI `@openai/codex@0.159.3` в
+runtime-образе. Он нужен для OAuth-входа и запуска задач, но не добавляет
+модельные API-ключи.
