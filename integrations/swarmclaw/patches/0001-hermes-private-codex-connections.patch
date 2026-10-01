@@ -1,0 +1,255 @@
+diff --git a/src/lib/server/hermes-private-auth.ts b/src/lib/server/hermes-private-auth.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/server/hermes-private-auth.ts
+@@ -0,0 +1,24 @@
++import { timingSafeEqual } from 'node:crypto'
++
++export type HermesServiceAuthorization =
++  | { authorized: true }
++  | { authorized: false; reason: 'not_configured' | 'invalid_key' }
++
++export const authorizeHermesServiceRequest = (
++  request: Request,
++  configuredKey = process.env.HERMES_SWARMCLAW_SERVICE_KEY || '',
++): HermesServiceAuthorization => {
++  if (!configuredKey) return { authorized: false, reason: 'not_configured' }
++
++  const receivedKey = request.headers.get('x-hermes-service-key') || ''
++  const expected = Buffer.from(configuredKey)
++  const received = Buffer.from(receivedKey)
++
++  if (expected.length !== received.length) {
++    return { authorized: false, reason: 'invalid_key' }
++  }
++
++  return timingSafeEqual(expected, received)
++    ? { authorized: true }
++    : { authorized: false, reason: 'invalid_key' }
++}
+diff --git a/src/lib/server/hermes-provider-profile.ts b/src/lib/server/hermes-provider-profile.ts
+new file mode 100644
+--- /dev/null
++++ b/src/lib/server/hermes-provider-profile.ts
+@@ -0,0 +1,30 @@
++import path from 'node:path'
++
++const HERMES_PROVIDER_CONNECTION_PREFIX = 'hermes-provider:'
++const PROVIDER_CONNECTION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
++
++export const toHermesProviderCredentialId = (providerConnectionId: string): string => {
++  const normalizedId = providerConnectionId.trim().toLowerCase()
++  if (!PROVIDER_CONNECTION_ID_PATTERN.test(normalizedId)) {
++    throw new Error('providerConnectionId must be a UUID')
++  }
++  return `${HERMES_PROVIDER_CONNECTION_PREFIX}${normalizedId}`
++}
++
++export const getHermesProviderConnectionId = (credentialId: string | null | undefined): string | null => {
++  if (typeof credentialId !== 'string') return null
++  const normalizedCredentialId = credentialId.trim().toLowerCase()
++  if (!normalizedCredentialId.startsWith(HERMES_PROVIDER_CONNECTION_PREFIX)) return null
++
++  const providerConnectionId = normalizedCredentialId.slice(HERMES_PROVIDER_CONNECTION_PREFIX.length)
++  return PROVIDER_CONNECTION_ID_PATTERN.test(providerConnectionId) ? providerConnectionId : null
++}
++
++export const resolveCodexOAuthProfileHome = (
++  credentialId: string | null | undefined,
++  profileRoot = process.env.HERMES_OAUTH_PROFILE_ROOT || '/opt/data/hermes-oauth-profiles',
++): string | null => {
++  const providerConnectionId = getHermesProviderConnectionId(credentialId)
++  if (!providerConnectionId) return null
++  return path.join(profileRoot, 'codex', providerConnectionId)
++}
+diff --git a/src/lib/providers/codex-cli.ts b/src/lib/providers/codex-cli.ts
+--- a/src/lib/providers/codex-cli.ts
++++ b/src/lib/providers/codex-cli.ts
+@@ -8,6 +8,7 @@ import { loadRuntimeSettings } from '@/lib/server/runtime/runtime-settings'
+ import { resolveCliBinary, buildCliEnv, probeCliAuth, attachAbortHandler, symlinkConfigFiles, isStderrNoise, ensureCliWorkingDirectory } from './cli-utils'
+ import { getAgent } from '@/lib/server/agents/agent-repository'
+ import { loadMcpServers } from '@/lib/server/storage'
++import { resolveCodexOAuthProfileHome } from '@/lib/server/hermes-provider-profile'
+ 
+ const TAG = 'provider-codex'
+ 
+@@ -54,16 +55,21 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   // Read from stdin
+   args.push('-')
+ 
+-  // Build clean env — preserves user's CODEX_HOME for auth
++  // Hermes connections use a profile isolated by connection ID.
+   const env = buildCliEnv()
+   const effectiveCwd = ensureCliWorkingDirectory(session.cwd)
++  const hermesCodexHome = resolveCodexOAuthProfileHome(session.credentialId)
++  if (hermesCodexHome) {
++    fs.mkdirSync(hermesCodexHome, { recursive: true })
++    env.CODEX_HOME = hermesCodexHome
++  }
+ 
+   // Pass API key if available
+   if (session.apiKey) {
+     env.OPENAI_API_KEY = session.apiKey
+   }
+ 
+-  // Auth probe BEFORE creating the session CODEX_HOME — uses real config dir
++  // Auth probe uses the selected profile, never another user's CODEX_HOME.
+   if (!session.apiKey) {
+     const auth = probeCliAuth(binary, 'codex', env, effectiveCwd)
+     if (!auth.authenticated) {
+@@ -79,7 +85,7 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   const sessionCodexHome = perSessionHome
+   const agentForMcp = session.agentId ? getAgent(session.agentId as string) : null
+   const agentMcpServerIds: string[] = agentForMcp?.mcpServerIds || []
+-  const realCodexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
++  const realCodexHome = hermesCodexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+   fs.mkdirSync(sessionCodexHome, { recursive: true })
+ 
+   // Symlink auth/config files from real CODEX_HOME into session dir
+diff --git a/src/app/api/internal/hermes/executions/route.ts b/src/app/api/internal/hermes/executions/route.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/api/internal/hermes/executions/route.ts
+@@ -0,0 +1,97 @@
++import { NextResponse } from 'next/server'
++import { z } from 'zod'
++
++import { safeParseBody } from '@/lib/server/safe-parse-body'
++import { getAgent, saveAgent } from '@/lib/server/agents/agent-repository'
++import { authorizeHermesServiceRequest } from '@/lib/server/hermes-private-auth'
++import { toHermesProviderCredentialId } from '@/lib/server/hermes-provider-profile'
++import { createTaskFromRoute } from '@/lib/server/tasks/task-route-service'
++import type { Agent, BoardTask } from '@/types'
++
++const HermesExecutionSchema = z.object({
++  gatewayTaskId: z.string().uuid(),
++  providerConnectionId: z.string().uuid(),
++  organizationId: z.string().uuid(),
++  workspaceId: z.string().uuid().nullable(),
++  projectId: z.string().uuid().nullable(),
++  userId: z.string().uuid(),
++  title: z.string().trim().min(1).max(120).default('Hermes Workspace task'),
++  input: z.string().trim().min(1).max(20_000),
++  instructions: z.string().trim().max(20_000).default(''),
++}).strict()
++
++const toExecutionResponse = (task: BoardTask) => NextResponse.json({
++  executionId: task.id,
++  status: task.status,
++  output: typeof task.result === 'string' ? task.result : null,
++  error: typeof task.error === 'string' ? task.error : null,
++})
++
++const getHermesCodexAgentId = (providerConnectionId: string): string => (
++  `hermes-gateway-codex-${providerConnectionId}`
++)
++
++const ensureHermesCodexAgent = (providerConnectionId: string): Agent => {
++  const id = getHermesCodexAgentId(providerConnectionId)
++  const existing = getAgent(id)
++  if (existing) return existing
++
++  const now = Date.now()
++  const agent: Agent = {
++    id,
++    name: `Hermes Codex ${providerConnectionId.slice(0, 8)}`,
++    description: 'Технический агент Hermes Workspace для изолированного подключения Codex.',
++    systemPrompt: 'Выполняй только задачу, переданную Hermes Workspace Gateway.',
++    provider: 'codex-cli',
++    model: 'gpt-5.4-codex',
++    credentialId: toHermesProviderCredentialId(providerConnectionId),
++    fallbackCredentialIds: [],
++    heartbeatEnabled: false,
++    disabled: false,
++    createdAt: now,
++    updatedAt: now,
++  }
++  saveAgent(id, agent)
++  return agent
++}
++
++const authorize = (request: Request): NextResponse | null => {
++  const authorization = authorizeHermesServiceRequest(request)
++  if (authorization.authorized) return null
++  return NextResponse.json(
++    { error: authorization.reason === 'not_configured' ? 'Hermes private API is unavailable' : 'Unauthorized' },
++    { status: authorization.reason === 'not_configured' ? 503 : 401 },
++  )
++}
++
++export const POST = async (request: Request) => {
++  const unauthorized = authorize(request)
++  if (unauthorized) return unauthorized
++
++  const { data, error } = await safeParseBody<Record<string, unknown>>(request)
++  if (error) return error
++  const parsed = HermesExecutionSchema.safeParse(data)
++  if (!parsed.success) {
++    return NextResponse.json({ error: 'Invalid Hermes execution request' }, { status: 400 })
++  }
++
++  const agent = ensureHermesCodexAgent(parsed.data.providerConnectionId)
++  const result = createTaskFromRoute({
++    title: parsed.data.title,
++    description: `${parsed.data.instructions}\n\n${parsed.data.input}`.trim(),
++    status: 'queued',
++    agentId: agent.id,
++    customFields: {
++      hermesGatewayTaskId: parsed.data.gatewayTaskId,
++      hermesProviderConnectionId: parsed.data.providerConnectionId,
++      hermesOrganizationId: parsed.data.organizationId,
++      hermesWorkspaceId: parsed.data.workspaceId,
++      hermesProjectId: parsed.data.projectId,
++      hermesUserId: parsed.data.userId,
++    },
++  })
++
++  return result.ok
++    ? toExecutionResponse(result.payload)
++    : NextResponse.json({ error: result.payload }, { status: result.status })
++}
+diff --git a/src/app/api/internal/hermes/executions/[id]/route.ts b/src/app/api/internal/hermes/executions/[id]/route.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/api/internal/hermes/executions/[id]/route.ts
+@@ -0,0 +1,40 @@
++import { NextResponse } from 'next/server'
++
++import { authorizeHermesServiceRequest } from '@/lib/server/hermes-private-auth'
++import { loadTask } from '@/lib/server/tasks/task-repository'
++import { updateTaskFromRoute } from '@/lib/server/tasks/task-route-service'
++import type { BoardTask } from '@/types'
++
++const toExecutionResponse = (task: BoardTask) => NextResponse.json({
++  executionId: task.id,
++  status: task.status,
++  output: typeof task.result === 'string' ? task.result : null,
++  error: typeof task.error === 'string' ? task.error : null,
++})
++
++const authorize = (request: Request): NextResponse | null => {
++  const authorization = authorizeHermesServiceRequest(request)
++  if (authorization.authorized) return null
++  return NextResponse.json(
++    { error: authorization.reason === 'not_configured' ? 'Hermes private API is unavailable' : 'Unauthorized' },
++    { status: authorization.reason === 'not_configured' ? 503 : 401 },
++  )
++}
++
++export const GET = async (request: Request, context: { params: Promise<{ id: string }> }) => {
++  const unauthorized = authorize(request)
++  if (unauthorized) return unauthorized
++  const { id } = await context.params
++  const task = loadTask(id)
++  return task ? toExecutionResponse(task) : NextResponse.json({ error: 'Execution not found' }, { status: 404 })
++}
++
++export const DELETE = async (request: Request, context: { params: Promise<{ id: string }> }) => {
++  const unauthorized = authorize(request)
++  if (unauthorized) return unauthorized
++  const { id } = await context.params
++  const result = updateTaskFromRoute(id, { status: 'cancelled' })
++  return result.ok
++    ? toExecutionResponse(result.payload)
++    : NextResponse.json({ error: result.payload }, { status: result.status })
++}
