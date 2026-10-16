@@ -45,3 +45,20 @@ Patch-set добавляет:
 `0003-install-codex-cli.patch` закрепляет CLI `@openai/codex@0.159.3` в
 runtime-образе. Он нужен для OAuth-входа и запуска задач, но не добавляет
 модельные API-ключи.
+
+`0004-hermes-private-proxy-auth.patch` исправляет блокировку service key общим
+`ACCESS_KEY` proxy. Только существующие execution-маршруты и методы используют
+собственную проверку `HERMES_SWARMCLAW_SERVICE_KEY`; без ключа запрос отклоняется,
+без настроенного ключа возвращается 503. Остальные API сохраняют прежнюю защиту.
+Проверка ключа внутри обработчиков также остаётся включённой.
+
+После применения четвёртого patch запустите тесты на исходниках SwarmClaw:
+
+```bash
+node --import tsx --test src/lib/server/hermes-private-auth.test.ts \
+  src/lib/server/hermes-provider-profile.test.ts \
+  src/lib/server/hermes-private-proxy.test.ts src/proxy.test.ts
+```
+
+Затем пересоберите и пересоздайте только контейнер SwarmClaw. Проверка из Gateway
+с пустым телом запроса должна вернуть 401 без service key и 400 с верным ключом.
