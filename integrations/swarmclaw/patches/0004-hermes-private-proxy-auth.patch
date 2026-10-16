@@ -1,0 +1,143 @@
+diff --git a/src/lib/server/hermes-private-auth.ts b/src/lib/server/hermes-private-auth.ts
+index 9406afd..3b28a5c 100644
+--- a/src/lib/server/hermes-private-auth.ts
++++ b/src/lib/server/hermes-private-auth.ts
+@@ -1,5 +1,15 @@
+ import { timingSafeEqual } from 'node:crypto'
+ 
++export const isHermesExecutionRoute = (pathname: string, method: string): boolean => {
++  if (pathname === '/api/internal/hermes/executions' || pathname === '/api/internal/hermes/executions/') {
++    return method === 'POST'
++  }
++
++  const executionPath = /^\/api\/internal\/hermes\/executions\/[^/]+(\/stop)?\/?$/.exec(pathname)
++  if (!executionPath) return false
++  return executionPath[1] ? method === 'POST' : method === 'GET' || method === 'DELETE'
++}
++
+ export type HermesServiceAuthorization =
+   | { authorized: true }
+   | { authorized: false; reason: 'not_configured' | 'invalid_key' }
+diff --git a/src/lib/server/hermes-private-proxy.test.ts b/src/lib/server/hermes-private-proxy.test.ts
+new file mode 100644
+index 0000000..d8c9619
+--- /dev/null
++++ b/src/lib/server/hermes-private-proxy.test.ts
+@@ -0,0 +1,86 @@
++import assert from 'node:assert/strict'
++import { afterEach, test } from 'node:test'
++import { NextRequest } from 'next/server'
++
++import { proxy } from '../../proxy'
++import { isHermesExecutionRoute } from './hermes-private-auth'
++
++const originalServiceKey = process.env.HERMES_SWARMCLAW_SERVICE_KEY
++const originalAccessKey = process.env.ACCESS_KEY
++
++afterEach(() => {
++  if (originalServiceKey === undefined) delete process.env.HERMES_SWARMCLAW_SERVICE_KEY
++  else process.env.HERMES_SWARMCLAW_SERVICE_KEY = originalServiceKey
++  if (originalAccessKey === undefined) delete process.env.ACCESS_KEY
++  else process.env.ACCESS_KEY = originalAccessKey
++})
++
++test('пропускает service key при включённом общем ACCESS_KEY', () => {
++  process.env.ACCESS_KEY = 'dashboard-test-key'
++  process.env.HERMES_SWARMCLAW_SERVICE_KEY = 'service-test-key'
++  const response = proxy(new NextRequest('http://localhost/api/internal/hermes/executions', {
++    method: 'POST',
++    headers: { 'x-hermes-service-key': 'service-test-key' },
++  }))
++  assert.equal(response.status, 200)
++  assert.equal(response.headers.get('x-middleware-next'), '1')
++})
++
++test('отклоняет отсутствующий и неверный service key', () => {
++  process.env.ACCESS_KEY = 'dashboard-test-key'
++  process.env.HERMES_SWARMCLAW_SERVICE_KEY = 'service-test-key'
++  for (const key of ['', 'wrong-key']) {
++    const response = proxy(new NextRequest('http://localhost/api/internal/hermes/executions', {
++      method: 'POST',
++      headers: { 'x-hermes-service-key': key },
++    }))
++    assert.equal(response.status, 401)
++  }
++})
++
++test('общий ключ не заменяет service key', () => {
++  process.env.ACCESS_KEY = 'dashboard-test-key'
++  process.env.HERMES_SWARMCLAW_SERVICE_KEY = 'service-test-key'
++  const response = proxy(new NextRequest('http://localhost/api/internal/hermes/executions', {
++    method: 'POST',
++    headers: { 'x-access-key': 'dashboard-test-key' },
++  }))
++  assert.equal(response.status, 401)
++})
++
++test('без настройки service key маршрут закрыт даже в режиме без ACCESS_KEY', () => {
++  delete process.env.ACCESS_KEY
++  delete process.env.HERMES_SWARMCLAW_SERVICE_KEY
++  const response = proxy(new NextRequest('http://localhost/api/internal/hermes/executions', { method: 'POST' }))
++  assert.equal(response.status, 503)
++})
++
++test('service key не открывает соседние API', () => {
++  process.env.ACCESS_KEY = 'dashboard-test-key'
++  process.env.HERMES_SWARMCLAW_SERVICE_KEY = 'service-test-key'
++  for (const pathname of ['/api/agents', '/api/internal/hermes/executions-admin', '/api/internal/hermes/executions/id/stop/extra']) {
++    const response = proxy(new NextRequest(`http://localhost${pathname}`, {
++      method: 'POST',
++      headers: { 'x-hermes-service-key': 'service-test-key' },
++    }))
++    assert.equal(response.status, 401)
++  }
++})
++
++test('распознаёт только существующие методы и формы execution-маршрутов', () => {
++  for (const [pathname, method] of [
++    ['/api/internal/hermes/executions', 'POST'],
++    ['/api/internal/hermes/executions/', 'POST'],
++    ['/api/internal/hermes/executions/task-123', 'GET'],
++    ['/api/internal/hermes/executions/task-123/', 'DELETE'],
++    ['/api/internal/hermes/executions/task-123/stop', 'POST'],
++  ]) assert.equal(isHermesExecutionRoute(pathname, method), true)
++
++  for (const [pathname, method] of [
++    ['/api/internal/hermes/executions', 'GET'],
++    ['/api/internal/hermes/executions/task-123', 'PATCH'],
++    ['/api/internal/hermes/executions/task-123/stop', 'GET'],
++    ['/api/internal/hermes/executions/task-123/stop/extra', 'POST'],
++    ['/api/internal/hermes/executions-other', 'POST'],
++  ]) assert.equal(isHermesExecutionRoute(pathname, method), false)
++})
+diff --git a/src/proxy.ts b/src/proxy.ts
+index c01768b..f48231b 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -1,6 +1,7 @@
+ import { NextResponse } from 'next/server'
+ import type { NextRequest } from 'next/server'
+ import { AUTH_COOKIE_NAME } from '@/lib/auth'
++import { authorizeHermesServiceRequest, isHermesExecutionRoute } from '@/lib/server/hermes-private-auth'
+ import {
+   buildExtensionInstallCorsHeaders,
+   isExtensionInstallCorsPath,
+@@ -71,6 +72,18 @@ function withExtensionInstallCorsHeaders(pathname: string, origin: string | null
+ export function proxy(request: NextRequest) {
+   const rateLimitEnabled = isRateLimitEnabled()
+   const { pathname } = request.nextUrl
++  // Закрытые execution-маршруты проверяют собственный service key до общей авторизации.
++  if (isHermesExecutionRoute(pathname, request.method)) {
++    const authorization = authorizeHermesServiceRequest(request)
++    if (!authorization.authorized) {
++      return NextResponse.json(
++        { error: authorization.reason === 'not_configured' ? 'Hermes private API is unavailable' : 'Unauthorized' },
++        { status: authorization.reason === 'not_configured' ? 503 : 401 },
++      )
++    }
++    return NextResponse.next()
++  }
++
+   const corsOrigin = resolveExtensionInstallCorsOrigin(request.headers.get('origin'))
+   const isWebhookTrigger = request.method === 'POST'
+     && /^\/api\/webhooks\/[^/]+\/?$/.test(pathname)
