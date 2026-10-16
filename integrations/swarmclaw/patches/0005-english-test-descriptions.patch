@@ -1,0 +1,34 @@
+diff --git a/src/lib/server/hermes-private-proxy.test.ts b/src/lib/server/hermes-private-proxy.test.ts
+--- a/src/lib/server/hermes-private-proxy.test.ts
++++ b/src/lib/server/hermes-private-proxy.test.ts
+@@ -18,2 +18,2 @@
+-test('пропускает service key при включённом общем ACCESS_KEY', () => {
++test('accepts the service key when dashboard ACCESS_KEY is enabled', () => {
+   process.env.ACCESS_KEY = 'dashboard-test-key'
+@@ -29,2 +29,2 @@
+-test('отклоняет отсутствующий и неверный service key', () => {
++test('rejects missing and incorrect service keys', () => {
+   process.env.ACCESS_KEY = 'dashboard-test-key'
+@@ -43,2 +43,2 @@
+-test('общий ключ не заменяет service key', () => {
++test('does not accept the dashboard key as a service key', () => {
+   process.env.ACCESS_KEY = 'dashboard-test-key'
+@@ -54,2 +54,2 @@
+-test('без настройки service key маршрут закрыт даже в режиме без ACCESS_KEY', () => {
++test('fails closed when the service key is not configured', () => {
+   delete process.env.ACCESS_KEY
+@@ -62,2 +62,2 @@
+-test('service key не открывает соседние API', () => {
++test('does not grant service-key access to other API routes', () => {
+   process.env.ACCESS_KEY = 'dashboard-test-key'
+@@ -75,2 +75,2 @@
+-test('распознаёт только существующие методы и формы execution-маршрутов', () => {
++test('matches only supported execution paths and methods', () => {
+   for (const [pathname, method] of [
+diff --git a/src/proxy.ts b/src/proxy.ts
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -75,2 +75,2 @@
+-  // Закрытые execution-маршруты проверяют собственный service key до общей авторизации.
++  // Authenticate private execution routes before dashboard access-key checks.
+   if (isHermesExecutionRoute(pathname, request.method)) {
