@@ -1,0 +1,334 @@
+diff --git a/src/app/api/internal/hermes/executions/route.ts b/src/app/api/internal/hermes/executions/route.ts
+index 99b9388..5bc5752 100644
+--- a/src/app/api/internal/hermes/executions/route.ts
++++ b/src/app/api/internal/hermes/executions/route.ts
+@@ -7,6 +7,7 @@ import { authorizeHermesServiceRequest } from '@/lib/server/hermes-private-auth'
+ import { toHermesProviderCredentialId } from '@/lib/server/hermes-provider-profile'
+ import { createTaskFromRoute } from '@/lib/server/tasks/task-route-service'
+ import type { Agent, BoardTask } from '@/types'
++import { HERMES_CODEX_DEFAULT_MODEL } from '@/lib/providers/codex-execution-policy'
+ 
+ const HermesExecutionSchema = z.object({
+   gatewayTaskId: z.string().uuid(),
+@@ -34,16 +35,26 @@ const getHermesCodexAgentId = (providerConnectionId: string): string => (
+ const ensureHermesCodexAgent = (providerConnectionId: string): Agent => {
+   const id = getHermesCodexAgentId(providerConnectionId)
+   const existing = getAgent(id)
+-  if (existing) return existing
++  if (existing) {
++    if (existing.provider !== 'codex-cli' || existing.credentialId !== toHermesProviderCredentialId(providerConnectionId)) {
++      throw new Error('Hermes execution agent has an unexpected provider connection')
++    }
++    if (existing.model === 'gpt-5.4-codex') {
++      const updated = { ...existing, model: HERMES_CODEX_DEFAULT_MODEL, updatedAt: Date.now() }
++      saveAgent(id, updated)
++      return updated
++    }
++    return existing
++  }
+ 
+   const now = Date.now()
+   const agent: Agent = {
+     id,
+     name: `Hermes Codex ${providerConnectionId.slice(0, 8)}`,
+-    description: 'Технический агент Hermes Workspace для изолированного подключения Codex.',
+-    systemPrompt: 'Выполняй только задачу, переданную Hermes Workspace Gateway.',
++    description: 'Hermes Workspace execution agent for an isolated Codex connection.',
++    systemPrompt: 'Execute only the task supplied by Hermes Workspace Gateway.',
+     provider: 'codex-cli',
+-    model: 'gpt-5.4-codex',
++    model: HERMES_CODEX_DEFAULT_MODEL,
+     credentialId: toHermesProviderCredentialId(providerConnectionId),
+     fallbackCredentialIds: [],
+     heartbeatEnabled: false,
+@@ -80,6 +91,7 @@ export const POST = async (request: Request) => {
+     title: parsed.data.title,
+     description: `${parsed.data.instructions}\n\n${parsed.data.input}`.trim(),
+     status: 'queued',
++    maxAttempts: 1,
+     agentId: agent.id,
+     customFields: {
+       hermesGatewayTaskId: parsed.data.gatewayTaskId,
+diff --git a/src/lib/providers/codex-cli.ts b/src/lib/providers/codex-cli.ts
+index 2661a59..eb97aaf 100644
+--- a/src/lib/providers/codex-cli.ts
++++ b/src/lib/providers/codex-cli.ts
+@@ -9,6 +9,7 @@ import { resolveCliBinary, buildCliEnv, probeCliAuth, attachAbortHandler, symlin
+ import { getAgent } from '@/lib/server/agents/agent-repository'
+ import { loadMcpServers } from '@/lib/server/storage'
+ import { resolveCodexOAuthProfileHome } from '@/lib/server/hermes-provider-profile'
++import { getCodexCloseError, readCodexEventError, resolveCodexModelOverride } from './codex-execution-policy'
+ 
+ const TAG = 'provider-codex'
+ 
+@@ -23,10 +24,11 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   if (!binary) {
+     const msg = 'Codex CLI not found. Install it and ensure it is on your PATH.'
+     write(`data: ${JSON.stringify({ t: 'err', text: msg })}\n\n`)
+-    return Promise.resolve('')
++    return Promise.reject(new Error(msg))
+   }
+ 
+   const prompt = message
++  const hermesCodexHome = resolveCodexOAuthProfileHome(session.credentialId)
+   const args: string[] = ['exec']
+   // Use ~/.codex-sessions/ not /tmp — codex refuses to create helper binaries under /tmp.
+   const sessionsDir = path.join(os.homedir(), '.codex-sessions')
+@@ -42,7 +44,8 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   // SwarmClaw runs in its own sandboxed environment so bypassing codex's sandbox is safe.
+   args.push('--json', '--dangerously-bypass-approvals-and-sandbox', '--skip-git-repo-check')
+ 
+-  if (session.model) args.push('-m', session.model)
++  const modelOverride = resolveCodexModelOverride(session.model, Boolean(hermesCodexHome))
++  if (modelOverride) args.push('-m', modelOverride)
+   if (codexModelRequiresReasoningDowngrade(session.model)) {
+     args.push('-c', 'model_reasoning_effort="high"')
+   }
+@@ -58,7 +61,6 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   // Hermes connections use a profile isolated by connection ID.
+   const env = buildCliEnv()
+   const effectiveCwd = ensureCliWorkingDirectory(session.cwd)
+-  const hermesCodexHome = resolveCodexOAuthProfileHome(session.credentialId)
+   if (hermesCodexHome) {
+     fs.mkdirSync(hermesCodexHome, { recursive: true })
+     env.CODEX_HOME = hermesCodexHome
+@@ -75,7 +77,7 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+     if (!auth.authenticated) {
+       log.error('codex-cli', auth.errorMessage || 'Auth failed')
+       write(`data: ${JSON.stringify({ t: 'err', text: auth.errorMessage || 'Codex CLI is not authenticated.' })}\n\n`)
+-      return Promise.resolve('')
++      return Promise.reject(new Error(auth.errorMessage || 'Codex CLI is not authenticated.'))
+     }
+   }
+ 
+@@ -170,6 +172,7 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+   let buf = ''
+   let eventCount = 0
+   let stderrText = ''
++  let providerError: string | null = null
+ 
+   proc.stdout!.on('data', (chunk: Buffer) => {
+     const raw = chunk.toString()
+@@ -187,6 +190,8 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+       try {
+         const ev = JSON.parse(line)
+         eventCount++
++        const eventError = readCodexEventError(ev)
++        if (eventError) providerError = eventError
+ 
+         // Track thread ID for session resume
+         const threadId = typeof ev.thread_id === 'string'
+@@ -274,15 +279,15 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+     }
+   })
+ 
+-  return new Promise((resolve) => {
++  return new Promise((resolve, reject) => {
+     proc.on('close', (code, sig) => {
+       log.info('codex-cli', `Process closed: code=${code} signal=${sig} events=${eventCount} response=${fullResponse.length}chars`)
+       active.delete(session.id)
+-      if ((code ?? 0) !== 0 && !fullResponse.trim()) {
+-        const msg = stderrText.trim()
+-          ? `Codex CLI exited with code ${code ?? 'unknown'}${sig ? ` (${sig})` : ''}: ${stderrText.trim().slice(0, 1200)}`
+-          : `Codex CLI exited with code ${code ?? 'unknown'}${sig ? ` (${sig})` : ''} and returned no output.`
++      const msg = getCodexCloseError(code, sig, providerError, stderrText)
++      if (msg) {
+         write(`data: ${JSON.stringify({ t: 'err', text: msg })}\n\n`)
++        reject(new Error(msg))
++        return
+       }
+       resolve(fullResponse)
+     })
+@@ -291,7 +296,7 @@ export function streamCodexCliChat({ session, message, imagePath, systemPrompt,
+       log.error('codex-cli', `Process error: ${e.message}`)
+       active.delete(session.id)
+       write(`data: ${JSON.stringify({ t: 'err', text: e.message })}\n\n`)
+-      resolve(fullResponse)
++      reject(e)
+     })
+   })
+ }
+diff --git a/src/lib/providers/codex-execution-policy.test.ts b/src/lib/providers/codex-execution-policy.test.ts
+new file mode 100644
+index 0000000..4202777
+--- /dev/null
++++ b/src/lib/providers/codex-execution-policy.test.ts
+@@ -0,0 +1,52 @@
++import assert from 'node:assert/strict'
++import { test } from 'node:test'
++import {
++  getCodexCloseError,
++  guardExecutionCompletion,
++  HERMES_CODEX_DEFAULT_MODEL,
++  readCodexEventError,
++  redactCodexDiagnostic,
++  resolveCodexModelOverride,
++} from './codex-execution-policy'
++
++test('uses the CLI default only for the Hermes default marker', () => {
++  assert.equal(resolveCodexModelOverride(HERMES_CODEX_DEFAULT_MODEL, true), null)
++  assert.equal(resolveCodexModelOverride('gpt-5.4-codex', true), 'gpt-5.4-codex')
++  assert.equal(resolveCodexModelOverride('user-selected-model', true), 'user-selected-model')
++  assert.equal(resolveCodexModelOverride(null, false), null)
++})
++
++test('extracts structured Codex provider errors', () => {
++  assert.equal(readCodexEventError({ type: 'error', error: { message: 'Model is not supported' } }), 'Model is not supported')
++  assert.equal(readCodexEventError({ type: 'turn.failed', error: { message: 'Auth expired' } }), 'Auth expired')
++  assert.equal(readCodexEventError({ type: 'error', message: JSON.stringify({ error: { message: 'Unsupported model' } }) }), 'Unsupported model')
++  assert.equal(readCodexEventError({ type: 'turn.completed' }), null)
++})
++
++test('rejects nonzero exits, signals, and provider errors even with exit code zero', () => {
++  assert.match(getCodexCloseError(1, null, null, '') ?? '', /code 1/)
++  assert.match(getCodexCloseError(null, 'SIGTERM', null, '') ?? '', /SIGTERM/)
++  assert.equal(getCodexCloseError(1, null, 'Model is not supported', ''), 'Model is not supported')
++  assert.equal(getCodexCloseError(0, null, 'Provider failed', ''), 'Provider failed')
++  assert.equal(getCodexCloseError(0, null, null, 'warning'), null)
++})
++
++test('never validates an errored run as completed', () => {
++  const original = { ok: true, reasons: [], checkedAt: 123 }
++  const result = guardExecutionCompletion(original, 'Provider rejected model')
++  assert.equal(result.ok, false)
++  assert.deepEqual(result.reasons, ['Provider rejected model'])
++  assert.equal(original.ok, true)
++  assert.equal(guardExecutionCompletion(original, null), original)
++})
++
++test('redacts configured secrets and structured OAuth tokens from diagnostics', () => {
++  const result = redactCodexDiagnostic(
++    'key=service-secret Bearer abc.def.token {"refresh_token":"refresh-value"}',
++    { HERMES_SWARMCLAW_SERVICE_KEY: 'service-secret' },
++  )
++  assert.equal(result.includes('service-secret'), false)
++  assert.equal(result.includes('abc.def.token'), false)
++  assert.equal(result.includes('refresh-value'), false)
++  assert.equal(result.includes('[REDACTED]'), true)
++})
+diff --git a/src/lib/providers/codex-execution-policy.ts b/src/lib/providers/codex-execution-policy.ts
+new file mode 100644
+index 0000000..e0cba0d
+--- /dev/null
++++ b/src/lib/providers/codex-execution-policy.ts
+@@ -0,0 +1,68 @@
++export const HERMES_CODEX_DEFAULT_MODEL = 'hermes-cli-default'
++
++export const resolveCodexModelOverride = (model: unknown, hermesProfile: boolean): string | null => {
++  if (typeof model !== 'string' || !model.trim()) return null
++  if (hermesProfile && model === HERMES_CODEX_DEFAULT_MODEL) return null
++  return model.trim()
++}
++
++export const readCodexEventError = (event: unknown): string | null => {
++  if (!event || typeof event !== 'object') return null
++  const value = event as Record<string, unknown>
++  if (value.type !== 'error' && value.type !== 'turn.failed') return null
++  const nested = value.error && typeof value.error === 'object'
++    ? (value.error as Record<string, unknown>).message
++    : null
++  const message = typeof nested === 'string' ? nested : value.message
++  if (typeof message !== 'string' || !message.trim()) return 'Codex reported an execution error'
++  try {
++    const parsed: unknown = JSON.parse(message)
++    if (parsed && typeof parsed === 'object') {
++      const inner = (parsed as Record<string, unknown>).error
++      if (inner && typeof inner === 'object' && typeof (inner as Record<string, unknown>).message === 'string') {
++        return String((inner as Record<string, unknown>).message).slice(0, 1200)
++      }
++    }
++  } catch { /* Plain-text provider errors do not need JSON parsing. */ }
++  return message.trim().slice(0, 1200)
++}
++
++export const getCodexCloseError = (
++  code: number | null,
++  signal: string | null,
++  providerError: string | null,
++  stderr: string,
++): string | null => {
++  if (providerError) return providerError
++  if (code === 0 && !signal) return null
++  return `Codex CLI exited with code ${code ?? 'unknown'}${signal ? ` (${signal})` : ''}${stderr.trim() ? `: ${stderr.trim().slice(0, 1200)}` : ' and returned no output.'}`
++}
++
++interface CompletionValidation {
++  ok: boolean
++  reasons: string[]
++  checkedAt: number
++}
++
++export const guardExecutionCompletion = (
++  validation: CompletionValidation,
++  runError: string | null | undefined,
++): CompletionValidation => {
++  if (!runError?.trim()) return validation
++  return { ...validation, ok: false, reasons: [runError.trim(), ...validation.reasons] }
++}
++
++export const redactCodexDiagnostic = (
++  text: string,
++  environment: Record<string, string | undefined> = process.env,
++): string => {
++  let result = text
++  for (const [name, value] of Object.entries(environment)) {
++    if (value && value.length >= 4 && /KEY|TOKEN|SECRET|PASSWORD|COOKIE|AUTH/i.test(name)) {
++      result = result.split(value).join('[REDACTED]')
++    }
++  }
++  return result
++    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
++    .replace(/("?(?:access_token|refresh_token|id_token|api_key|authorization|cookie)"?\s*[:=]\s*")[^"]*"/gi, '$1[REDACTED]"')
++}
+diff --git a/src/lib/server/logger.ts b/src/lib/server/logger.ts
+index 9800a31..863719d 100644
+--- a/src/lib/server/logger.ts
++++ b/src/lib/server/logger.ts
+@@ -2,6 +2,7 @@ import fs from 'fs'
+ import path from 'path'
+ 
+ import { DATA_DIR } from './data-dir'
++import { redactCodexDiagnostic } from '../providers/codex-execution-policy'
+ 
+ const LOG_FILE = path.join(DATA_DIR, 'app.log')
+ const MAX_SIZE = 5 * 1024 * 1024 // 5MB — rotate when exceeded
+@@ -31,6 +32,9 @@ function write(level: string, tag: string, message: string, data?: unknown) {
+     }
+   }
+   line += '\n'
++  if ((level === 'WARN' || level === 'ERROR') && (tag === 'codex-cli' || tag === 'provider-codex')) {
++    console.error(redactCodexDiagnostic(line).trimEnd())
++  }
+   try {
+     rotate()
+     fs.appendFileSync(LOG_FILE, line)
+diff --git a/src/lib/server/runtime/queue/core.ts b/src/lib/server/runtime/queue/core.ts
+index 0e64832..a74e393 100644
+--- a/src/lib/server/runtime/queue/core.ts
++++ b/src/lib/server/runtime/queue/core.ts
+@@ -1,4 +1,5 @@
+ import { log } from '@/lib/server/logger'
++import { guardExecutionCompletion } from '@/lib/providers/codex-execution-policy'
+ import { matchesCapabilities, filterAgentsByCapabilities, capabilityMatchScore } from '@/lib/server/agents/capability-match'
+ import { genId } from '@/lib/id'
+ import { dedup, hmrSingleton, jitteredBackoff } from '@/lib/shared-utils'
+@@ -1582,7 +1583,9 @@ export async function processNext() {
+           t2[taskId].artifacts = taskResult.artifacts.slice(0, 24)
+           t2[taskId].outputFiles = extractLikelyOutputFiles(enrichedResult).slice(0, 24)
+           t2[taskId].updatedAt = Date.now()
+-          const { validation } = refreshTaskCompletionValidation(t2[taskId], settings)
++          const { validation: completionValidation } = refreshTaskCompletionValidation(t2[taskId], settings)
++          const validation = guardExecutionCompletion(completionValidation, taskRun.error)
++          t2[taskId].validation = validation
+ 
+           const now = Date.now()
+           // Add a completion/failure comment from the executing agent.
+@@ -1609,7 +1612,7 @@ export async function processNext() {
+             // A run with no text, no tool calls, and no error gets an actionable
+             // reason instead of the generic "Result summary is empty." message.
+             const emptyRunReason = classifyEmptyRunOutcome(taskRun)
+-            const failureReason = (emptyRunReason || formatValidationFailure(validation.reasons)).slice(0, 500)
++            const failureReason = (taskRun.error || emptyRunReason || formatValidationFailure(validation.reasons)).slice(0, 500)
+             const retryState = scheduleRetryOrDeadLetter(t2[taskId], failureReason)
+             t2[taskId].completedAt = retryState === 'dead_lettered' ? null : t2[taskId].completedAt
+             t2[taskId].comments!.push({

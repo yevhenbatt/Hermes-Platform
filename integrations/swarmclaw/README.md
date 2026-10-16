@@ -67,3 +67,29 @@ node --import tsx --test src/lib/server/hermes-private-auth.test.ts \
 names and the authentication comment into English. Apply it after `0004`.
 It does not change runtime behavior or test assertions. Run the same test command
 above after applying it.
+
+`0006-codex-execution-failures.patch` removes the unsupported hardcoded model
+from Hermes Codex agents. A private marker tells the CLI adapter to omit `-m`
+and use the installed CLI/profile default. Existing Hermes agents with the old
+`gpt-5.4-codex` default are migrated when a new execution is created. Explicit
+model overrides are still passed to the CLI; this does not add a Desktop model
+selector or a model catalog API.
+
+The patch rejects CLI process failures and structured provider errors, and
+prevents errored queue runs from passing completion validation. New private
+executions have one attempt so a rejected model does not trigger automatic
+repeated runs. Codex warning/error diagnostics are mirrored to Docker stderr
+with configured secrets, bearer tokens and structured OAuth tokens redacted.
+Existing file logging remains available.
+
+Apply after patches 0001–0005. Run the existing tests plus:
+
+```bash
+node --import tsx --test src/lib/providers/codex-execution-policy.test.ts
+```
+
+Rebuild and recreate SwarmClaw once, then create a new Gateway smoke-test task.
+The earlier task `65d7eb52-3496-412d-8431-95c7ed524427` remains a historical false
+success; the patch does not rewrite its stored status. A successful OAuth login
+or catalog entry does not prove access to a particular model: verify the actual
+inference result.
