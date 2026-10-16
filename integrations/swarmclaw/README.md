@@ -62,3 +62,8 @@ node --import tsx --test src/lib/server/hermes-private-auth.test.ts \
 
 Затем пересоберите и пересоздайте только контейнер SwarmClaw. Проверка из Gateway
 с пустым телом запроса должна вернуть 401 без service key и 400 с верным ключом.
+
+`0005-english-test-descriptions.patch` translates the six proxy regression test
+names and the authentication comment into English. Apply it after `0004`.
+It does not change runtime behavior or test assertions. Run the same test command
+above after applying it.
