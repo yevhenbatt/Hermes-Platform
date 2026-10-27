@@ -93,3 +93,30 @@ The earlier task `65d7eb52-3496-412d-8431-95c7ed524427` remains a historical fal
 success; the patch does not rewrite its stored status. A successful OAuth login
 or catalog entry does not prove access to a particular model: verify the actual
 inference result.
+
+`0007-provider-connection-verification.patch` adds the service-key-protected
+`POST /api/internal/hermes/provider-connections/:id/verify` route. It runs
+`codex -c cli_auth_credentials_store="file" login status` for the exact UUID
+profile, with an 8-second timeout and bounded output. No inference is performed.
+Profile/auth-file symlinks outside that profile are rejected. The child process
+does not inherit API keys or service credentials. Responses contain only the
+connection UUID, provider, authentication boolean and verification method.
+
+Only `Logged in using ChatGPT` with exit code zero confirms OAuth readiness.
+Missing profiles and explicit logged-out/API-key status are unauthenticated.
+Unknown output, CLI errors and timeouts return 503. This checks cached CLI login
+status, not remote token validity, subscription entitlement or model availability.
+Gateway must check ownership before calling this internal route and update its
+connection status/audit atomically. The client cannot choose a filesystem path.
+
+Apply after 0001–0006 and run the existing tests plus:
+
+```bash
+node --import tsx --test src/lib/server/hermes-provider-verification.test.ts \
+  src/lib/server/hermes-provider-verification-route.test.ts
+```
+
+Deploy the SwarmClaw overlay before the corresponding Gateway verification API.
+Then test pending → active with an existing logged-in owner profile, pending
+without a profile, non-owner denial and revoked-connection denial. Do not revoke
+the working personal connection solely to exercise a negative test.
