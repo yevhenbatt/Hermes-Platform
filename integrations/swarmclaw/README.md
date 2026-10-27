@@ -120,3 +120,14 @@ Deploy the SwarmClaw overlay before the corresponding Gateway verification API.
 Then test pending → active with an existing logged-in owner profile, pending
 without a profile, non-owner denial and revoked-connection denial. Do not revoke
 the working personal connection solely to exercise a negative test.
+
+`0008-verifier-process-env.patch` fixes Next.js type checking after 0007.
+Next.js requires `NODE_ENV` on `NodeJS.ProcessEnv`; the verifier now explicitly
+sets it to `production`. The source allowlist accepts a plain environment map,
+so test fixtures do not need Next.js-specific properties. API keys and service
+credentials remain excluded. Run all private adapter tests, then rebuild once.
+
+The regression was reproduced locally using Next.js's required `NODE_ENV`
+declaration: original verifier and fixture failed type checking; both pass
+after this patch. All 8 verifier tests passed locally. Full Next.js production
+build and live checks must still be repeated on deployment.

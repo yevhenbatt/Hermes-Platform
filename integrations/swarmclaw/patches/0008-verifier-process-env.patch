@@ -1,0 +1,34 @@
+diff --git a/src/lib/server/hermes-provider-verification.test.ts b/src/lib/server/hermes-provider-verification.test.ts
+index e33f219..39cf131 100644
+--- a/src/lib/server/hermes-provider-verification.test.ts
++++ b/src/lib/server/hermes-provider-verification.test.ts
+@@ -66,7 +66,12 @@ test('does not pass provider API keys or service credentials to the CLI', () =>
+     PATH: '/usr/bin', HOME: '/home/service', CODEX_HOME: '/profiles/other',
+     OPENAI_API_KEY: 'api-secret', CODEX_API_KEY: 'codex-secret',
+     HERMES_SWARMCLAW_SERVICE_KEY: 'service-secret',
+-  }), { CODEX_HOME: '/profiles/selected', NO_COLOR: '1', PATH: '/usr/bin', HOME: '/home/service' })
++  }), { NODE_ENV: 'production', CODEX_HOME: '/profiles/selected', NO_COLOR: '1', PATH: '/usr/bin', HOME: '/home/service' })
++})
++
++test('sets a production environment without requiring NODE_ENV in the source', () => {
++  assert.equal(buildCodexVerificationEnv('/profiles/selected', {}).NODE_ENV, 'production')
++  assert.equal(buildCodexVerificationEnv('/profiles/selected', { NODE_ENV: 'development' }).NODE_ENV, 'production')
+ })
+ 
+ test('matches only the private verification method and exact UUID path', () => {
+diff --git a/src/lib/server/hermes-provider-verification.ts b/src/lib/server/hermes-provider-verification.ts
+index 991936b..4677686 100644
+--- a/src/lib/server/hermes-provider-verification.ts
++++ b/src/lib/server/hermes-provider-verification.ts
+@@ -38,9 +38,9 @@ const profileExists = async (profileHome: string): Promise<boolean> => {
+ 
+ export const buildCodexVerificationEnv = (
+   profileHome: string,
+-  source: NodeJS.ProcessEnv = process.env,
++  source: Record<string, string | undefined> = process.env,
+ ): NodeJS.ProcessEnv => {
+-  const environment: NodeJS.ProcessEnv = { CODEX_HOME: profileHome, NO_COLOR: '1' }
++  const environment: NodeJS.ProcessEnv = { NODE_ENV: 'production', CODEX_HOME: profileHome, NO_COLOR: '1' }
+   for (const key of ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'LANG', 'SYSTEMROOT']) {
+     if (source[key]) environment[key] = source[key]
+   }
