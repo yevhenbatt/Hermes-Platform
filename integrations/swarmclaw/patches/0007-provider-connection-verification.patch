@@ -1,0 +1,301 @@
+diff --git a/src/app/api/internal/hermes/provider-connections/[id]/verify/route.ts b/src/app/api/internal/hermes/provider-connections/[id]/verify/route.ts
+new file mode 100644
+index 0000000..72e6d23
+--- /dev/null
++++ b/src/app/api/internal/hermes/provider-connections/[id]/verify/route.ts
+@@ -0,0 +1,25 @@
++import { NextResponse } from 'next/server'
++import { authorizeHermesServiceRequest } from '@/lib/server/hermes-private-auth'
++import { toHermesProviderCredentialId } from '@/lib/server/hermes-provider-profile'
++import { verifyCodexProviderConnection } from '@/lib/server/hermes-provider-verification'
++
++export const POST = async (request: Request, context: { params: Promise<{ id: string }> }) => {
++  const authorization = authorizeHermesServiceRequest(request)
++  if (!authorization.authorized) {
++    return NextResponse.json(
++      { error: authorization.reason === 'not_configured' ? 'Hermes private API is unavailable' : 'Unauthorized' },
++      { status: authorization.reason === 'not_configured' ? 503 : 401 },
++    )
++  }
++  const { id } = await context.params
++  try {
++    toHermesProviderCredentialId(id)
++  } catch {
++    return NextResponse.json({ error: 'Invalid provider connection ID' }, { status: 400 })
++  }
++  try {
++    return NextResponse.json(await verifyCodexProviderConnection(id))
++  } catch {
++    return NextResponse.json({ error: 'Provider verification is unavailable' }, { status: 503 })
++  }
++}
+diff --git a/src/lib/server/hermes-private-auth.ts b/src/lib/server/hermes-private-auth.ts
+index 3b28a5c..8661dd2 100644
+--- a/src/lib/server/hermes-private-auth.ts
++++ b/src/lib/server/hermes-private-auth.ts
+@@ -1,5 +1,9 @@
+ import { timingSafeEqual } from 'node:crypto'
+ 
++export const isHermesProviderVerificationRoute = (pathname: string, method: string): boolean => (
++  method === 'POST' && /^\/api\/internal\/hermes\/provider-connections\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/verify\/?$/i.test(pathname)
++)
++
+ export const isHermesExecutionRoute = (pathname: string, method: string): boolean => {
+   if (pathname === '/api/internal/hermes/executions' || pathname === '/api/internal/hermes/executions/') {
+     return method === 'POST'
+diff --git a/src/lib/server/hermes-provider-verification-route.test.ts b/src/lib/server/hermes-provider-verification-route.test.ts
+new file mode 100644
+index 0000000..997cb6d
+--- /dev/null
++++ b/src/lib/server/hermes-provider-verification-route.test.ts
+@@ -0,0 +1,56 @@
++import assert from 'node:assert/strict'
++import { afterEach, beforeEach, test } from 'node:test'
++import { randomUUID } from 'node:crypto'
++import os from 'node:os'
++import path from 'node:path'
++import { POST } from '../../app/api/internal/hermes/provider-connections/[id]/verify/route'
++
++const connectionId = '6a5fb5be-ebaf-4aa9-af04-645b335510e6'
++const previousKey = process.env.HERMES_SWARMCLAW_SERVICE_KEY
++const previousRoot = process.env.HERMES_OAUTH_PROFILE_ROOT
++const context = () => ({ params: Promise.resolve({ id: connectionId }) })
++
++beforeEach(() => {
++  process.env.HERMES_SWARMCLAW_SERVICE_KEY = 'verification-test-key'
++  process.env.HERMES_OAUTH_PROFILE_ROOT = path.join(os.tmpdir(), `hermes-missing-profile-${randomUUID()}`)
++})
++
++afterEach(() => {
++  if (previousKey === undefined) delete process.env.HERMES_SWARMCLAW_SERVICE_KEY
++  else process.env.HERMES_SWARMCLAW_SERVICE_KEY = previousKey
++  if (previousRoot === undefined) delete process.env.HERMES_OAUTH_PROFILE_ROOT
++  else process.env.HERMES_OAUTH_PROFILE_ROOT = previousRoot
++})
++
++test('rejects missing or incorrect service credentials before verification', async () => {
++  for (const key of ['', 'wrong-key']) {
++    const response = await POST(new Request('http://localhost/verify', {
++      method: 'POST', headers: { 'x-hermes-service-key': key },
++    }), context())
++    assert.equal(response.status, 401)
++  }
++})
++
++test('fails closed when the private service key is not configured', async () => {
++  delete process.env.HERMES_SWARMCLAW_SERVICE_KEY
++  const response = await POST(new Request('http://localhost/verify', { method: 'POST' }), context())
++  assert.equal(response.status, 503)
++})
++
++test('rejects an invalid profile identifier', async () => {
++  const response = await POST(new Request('http://localhost/verify', {
++    method: 'POST', headers: { 'x-hermes-service-key': 'verification-test-key' },
++  }), { params: Promise.resolve({ id: '../another-profile' }) })
++  assert.equal(response.status, 400)
++})
++
++test('ignores caller authentication claims and returns only verified metadata', async () => {
++  const response = await POST(new Request('http://localhost/verify', {
++    method: 'POST', headers: { 'x-hermes-service-key': 'verification-test-key' },
++    body: JSON.stringify({ authenticated: true, profileHome: '/some/other/profile', status: 'active' }),
++  }), context())
++  assert.equal(response.status, 200)
++  assert.deepEqual(await response.json(), {
++    providerConnectionId: connectionId, provider: 'codex', authenticated: false, method: 'codex_login_status',
++  })
++})
+diff --git a/src/lib/server/hermes-provider-verification.test.ts b/src/lib/server/hermes-provider-verification.test.ts
+new file mode 100644
+index 0000000..e33f219
+--- /dev/null
++++ b/src/lib/server/hermes-provider-verification.test.ts
+@@ -0,0 +1,79 @@
++import assert from 'node:assert/strict'
++import { test } from 'node:test'
++import path from 'node:path'
++import { buildCodexVerificationEnv, verifyCodexProviderConnection, type CodexVerificationDependencies } from './hermes-provider-verification'
++import { isHermesProviderVerificationRoute } from './hermes-private-auth'
++
++const connectionId = '6a5fb5be-ebaf-4aa9-af04-645b335510e6'
++
++test('verifies only the selected profile and never returns CLI output', async () => {
++  let checkedHome = ''
++  const dependencies: CodexVerificationDependencies = {
++    profileExists: async (home) => { checkedHome = home; return true },
++    runStatus: async (home) => {
++      assert.equal(home, checkedHome)
++      return { exitCode: 0, stdout: '', stderr: 'Logged in using ChatGPT\n' }
++    },
++  }
++  const result = await verifyCodexProviderConnection(connectionId, dependencies)
++  assert.equal(path.basename(checkedHome), connectionId)
++  assert.equal(path.basename(path.dirname(checkedHome)), 'codex')
++  assert.deepEqual(result, { providerConnectionId: connectionId, provider: 'codex', authenticated: true, method: 'codex_login_status' })
++})
++
++test('does not start CLI when the profile does not exist', async () => {
++  const result = await verifyCodexProviderConnection(connectionId, {
++    profileExists: async () => false,
++    runStatus: async () => { throw new Error('CLI must not be called') },
++  })
++  assert.equal(result.authenticated, false)
++})
++
++test('rejects invalid IDs before accessing files or starting CLI', async () => {
++  await assert.rejects(verifyCodexProviderConnection('../other-profile', {
++    profileExists: async () => { throw new Error('Files must not be accessed') },
++    runStatus: async () => { throw new Error('CLI must not be called') },
++  }), /UUID/)
++})
++
++test('does not treat logged-out or API-key profiles as ChatGPT OAuth', async () => {
++  for (const probe of [
++    { exitCode: 1, stdout: '', stderr: 'Not logged in' },
++    { exitCode: 0, stdout: 'Logged in using an API key', stderr: '' },
++  ]) {
++    const result = await verifyCodexProviderConnection(connectionId, {
++      profileExists: async () => true, runStatus: async () => probe,
++    })
++    assert.equal(result.authenticated, false)
++  }
++})
++
++test('reports CLI timeouts, unknown output and execution errors as unavailable', async () => {
++  for (const probe of [
++    { exitCode: null, stdout: '', stderr: 'timeout' },
++    { exitCode: 1, stdout: '', stderr: 'configuration error' },
++    { exitCode: 0, stdout: 'unexpected output', stderr: '' },
++    { exitCode: 1, stdout: 'Logged in using ChatGPT', stderr: '' },
++  ]) {
++    await assert.rejects(verifyCodexProviderConnection(connectionId, {
++      profileExists: async () => true, runStatus: async () => probe,
++    }), /could not be verified/)
++  }
++})
++
++test('does not pass provider API keys or service credentials to the CLI', () => {
++  assert.deepEqual(buildCodexVerificationEnv('/profiles/selected', {
++    PATH: '/usr/bin', HOME: '/home/service', CODEX_HOME: '/profiles/other',
++    OPENAI_API_KEY: 'api-secret', CODEX_API_KEY: 'codex-secret',
++    HERMES_SWARMCLAW_SERVICE_KEY: 'service-secret',
++  }), { CODEX_HOME: '/profiles/selected', NO_COLOR: '1', PATH: '/usr/bin', HOME: '/home/service' })
++})
++
++test('matches only the private verification method and exact UUID path', () => {
++  const pathname = `/api/internal/hermes/provider-connections/${connectionId}/verify`
++  assert.equal(isHermesProviderVerificationRoute(pathname, 'POST'), true)
++  assert.equal(isHermesProviderVerificationRoute(`${pathname}/`, 'POST'), true)
++  assert.equal(isHermesProviderVerificationRoute(pathname, 'GET'), false)
++  assert.equal(isHermesProviderVerificationRoute(`${pathname}/extra`, 'POST'), false)
++  assert.equal(isHermesProviderVerificationRoute('/api/internal/hermes/provider-connections/other/verify', 'POST'), false)
++})
+diff --git a/src/lib/server/hermes-provider-verification.ts b/src/lib/server/hermes-provider-verification.ts
+new file mode 100644
+index 0000000..991936b
+--- /dev/null
++++ b/src/lib/server/hermes-provider-verification.ts
+@@ -0,0 +1,81 @@
++import { execFile } from 'node:child_process'
++import { realpath, stat } from 'node:fs/promises'
++import path from 'node:path'
++import { resolveCodexOAuthProfileHome, toHermesProviderCredentialId } from './hermes-provider-profile'
++
++export interface CodexStatusResult {
++  exitCode: number | null
++  stdout: string
++  stderr: string
++}
++
++export interface CodexVerificationDependencies {
++  profileExists: (profileHome: string) => Promise<boolean>
++  runStatus: (profileHome: string) => Promise<CodexStatusResult>
++}
++
++export interface HermesProviderVerification {
++  providerConnectionId: string
++  provider: 'codex'
++  authenticated: boolean
++  method: 'codex_login_status'
++}
++
++const profileExists = async (profileHome: string): Promise<boolean> => {
++  try {
++    if (!(await stat(profileHome)).isDirectory()) return false
++    const actualHome = await realpath(profileHome)
++    const actualAuthFile = await realpath(path.join(profileHome, 'auth.json'))
++    if (actualHome !== path.resolve(profileHome) || path.dirname(actualAuthFile) !== actualHome) {
++      throw new Error('OAuth profile must not reference another directory')
++    }
++    return (await stat(actualAuthFile)).isFile()
++  } catch (error) {
++    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return false
++    throw error
++  }
++}
++
++export const buildCodexVerificationEnv = (
++  profileHome: string,
++  source: NodeJS.ProcessEnv = process.env,
++): NodeJS.ProcessEnv => {
++  const environment: NodeJS.ProcessEnv = { CODEX_HOME: profileHome, NO_COLOR: '1' }
++  for (const key of ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'LANG', 'SYSTEMROOT']) {
++    if (source[key]) environment[key] = source[key]
++  }
++  return environment
++}
++
++const runStatus = (profileHome: string): Promise<CodexStatusResult> => new Promise((resolve) => {
++  execFile('codex', ['-c', 'cli_auth_credentials_store="file"', 'login', 'status'], {
++    env: buildCodexVerificationEnv(profileHome),
++    timeout: 8000,
++    maxBuffer: 8192,
++    encoding: 'utf8',
++    shell: false,
++  }, (error, stdout, stderr) => {
++    resolve({ exitCode: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout, stderr })
++  })
++})
++
++export const verifyCodexProviderConnection = async (
++  providerConnectionId: string,
++  dependencies: CodexVerificationDependencies = { profileExists, runStatus },
++): Promise<HermesProviderVerification> => {
++  const credentialId = toHermesProviderCredentialId(providerConnectionId)
++  const profileHome = resolveCodexOAuthProfileHome(credentialId)
++  if (!profileHome) throw new Error('Invalid provider connection')
++  const response: HermesProviderVerification = {
++    providerConnectionId, provider: 'codex', authenticated: false, method: 'codex_login_status',
++  }
++  if (!await dependencies.profileExists(profileHome)) return response
++  const result = await dependencies.runStatus(profileHome)
++  const status = `${result.stdout}\n${result.stderr}`.trim()
++  if (result.exitCode === 0 && /^logged in using chatgpt$/im.test(status)) {
++    return { ...response, authenticated: true }
++  }
++  if ((result.exitCode === 1 && /not logged in/i.test(status)) ||
++      (result.exitCode === 0 && /logged in using (?:an? )?api key/i.test(status))) return response
++  throw new Error('Codex login status could not be verified')
++}
+diff --git a/src/proxy.ts b/src/proxy.ts
+index b3c23a4..3c26bc9 100644
+--- a/src/proxy.ts
++++ b/src/proxy.ts
+@@ -1,7 +1,7 @@
+ import { NextResponse } from 'next/server'
+ import type { NextRequest } from 'next/server'
+ import { AUTH_COOKIE_NAME } from '@/lib/auth'
+-import { authorizeHermesServiceRequest, isHermesExecutionRoute } from '@/lib/server/hermes-private-auth'
++import { authorizeHermesServiceRequest, isHermesExecutionRoute, isHermesProviderVerificationRoute } from '@/lib/server/hermes-private-auth'
+ import {
+   buildExtensionInstallCorsHeaders,
+   isExtensionInstallCorsPath,
+@@ -73,7 +73,7 @@ export function proxy(request: NextRequest) {
+   const rateLimitEnabled = isRateLimitEnabled()
+   const { pathname } = request.nextUrl
+   // Authenticate private execution routes before dashboard access-key checks.
+-  if (isHermesExecutionRoute(pathname, request.method)) {
++  if (isHermesExecutionRoute(pathname, request.method) || isHermesProviderVerificationRoute(pathname, request.method)) {
+     const authorization = authorizeHermesServiceRequest(request)
+     if (!authorization.authorized) {
+       return NextResponse.json(
