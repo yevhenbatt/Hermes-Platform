@@ -1,9 +1,10 @@
 diff --git a/src/lib/server/tasks/task-validation.ts b/src/lib/server/tasks/task-validation.ts
 --- a/src/lib/server/tasks/task-validation.ts
 +++ b/src/lib/server/tasks/task-validation.ts
-@@ -16,4 +16,5 @@ const MIN_RESULT_CHARS_GENERIC = 20
+@@ -16,4 +16,6 @@ const MIN_RESULT_CHARS_GENERIC = 20
  const SHORT_ANSWER_REQUEST_PATTERNS: RegExp[] = [
 +  /(?:^|[^а-яё])(?:одним\s+словом|одно\s+слово|одной\s+фразой|одним\s+предложением)(?=$|[^а-яё])/iu,
++  /(?:^|[^\p{L}\p{N}_])(?:одним\s+словом|одне\s+слово|однією\s+фразою|одним\s+реченням)(?=$|[^\p{L}\p{N}_])/iu,
    /\bone[\s-]word\b/i,
    /\bsingle[\s-]word\b/i,
    /\byes\s+or\s+no\b/i,
@@ -14,23 +15,23 @@ diff --git a/src/lib/server/tasks/task-validation.test.ts b/src/lib/server/tasks
    }
  })
  
-+test('validateTaskCompletion recognizes Russian short-answer requests', () => {
-+  for (const description of ['Ответь одним словом: OK.', 'Напиши одно слово.', 'Ответь одной фразой.', 'Ответь одним предложением.']) {
++test('validateTaskCompletion recognizes Russian and Ukrainian short-answer requests', () => {
++  for (const description of ['Ответь одним словом: OK.', 'Напиши одно слово.', 'Ответь одной фразой.', 'Ответь одним предложением.', 'Відповідай одним словом: OK.', 'Напиши одне слово.', 'Відповідай однією фразою.', 'Відповідай одним реченням.']) {
 +    const validation = validateTaskCompletion({ title: 'Hermes task', description, result: 'OK', error: null })
 +    assert.equal(validation.ok, true, description)
 +  }
 +})
 +
-+test('Russian short-answer requests do not permit empty results or errors', () => {
-+  const empty = validateTaskCompletion({ title: 'Hermes task', description: 'Ответь одним словом.', result: '', error: null })
-+  const failed = validateTaskCompletion({ title: 'Hermes task', description: 'Ответь одним словом.', result: 'OK', error: 'Provider failed' })
++test('Ukrainian short-answer requests do not permit empty results or errors', () => {
++  const empty = validateTaskCompletion({ title: 'Hermes task', description: 'Відповідай одним словом.', result: '', error: null })
++  const failed = validateTaskCompletion({ title: 'Hermes task', description: 'Відповідай одним словом.', result: 'OK', error: 'Provider failed' })
 +  assert.equal(empty.ok, false)
 +  assert.equal(failed.ok, false)
 +})
 +
-+test('Russian short-answer requests do not bypass explicit quality gates', () => {
++test('Ukrainian short-answer requests do not bypass explicit quality gates', () => {
 +  const validation = validateTaskCompletion({
-+    title: 'Hermes task', description: 'Ответь одним словом.', result: 'OK', error: null,
++    title: 'Hermes task', description: 'Відповідай одним словом.', result: 'OK', error: null,
 +    qualityGate: { enabled: true, minResultChars: 20, minEvidenceItems: 0 },
 +  })
 +  assert.equal(validation.ok, false)
